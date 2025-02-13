@@ -1,0 +1,289 @@
+
+import flixel.addons.transition.FlxTransitionableState;
+import flixel.group.FlxTypedGroup;
+import flixel.math.FlxPoint;
+import flixel.text.FlxText;
+import flixel.tweens.FlxTween;
+import flixel.tweens.FlxEase;
+import flixel.FlxG;
+import flixel.FlxObject;
+import flixel.FlxSprite;
+import funkin.audio.FunkinSound;
+import funkin.data.song.SongRegistry;
+import funkin.modding.module.Module;
+import funkin.modding.module.ModuleHandler;
+import funkin.play.PlayStatePlaylist;
+import funkin.save.Save;
+import funkin.ui.MusicBeatSubState;
+import funkin.ui.TextMenuList;
+import funkin.ui.transition.LoadingState;
+import funkin.util.tools.StringTools;
+import funkin.util.FileUtil;
+import funkin.util.WindowUtil;
+import funkin.Paths;
+import lime.graphics.Image;
+import openfl.display.BitmapData;
+import haxe.Json;
+import Std;
+
+/**
+ * What if the debug menu was orange
+ */
+class InputViewer extends MusicBeatSubState
+{
+    public function new() 
+    {
+        super();
+    }
+
+    var prevSelected:Int = -1;
+    var camFocusPoint:FlxObject;
+    var items:TextMenuList;
+
+    var inputRecorderModule:Module = ModuleHandler.getModule("InputRecorder");
+    var savePath:String = inputRecorderModule.scriptGet("REPLAY_SAVE_PATHS");
+
+    var descTxt:FlxText;
+    var validReplayPaths:Array<String> = [];
+    var allReplayDatas:Array<Dynamic> = [];
+
+    var replayPreviews:FlxTypedGroup;
+
+    public override function create() 
+    {
+        FlxTransitionableState.skipNextTransIn = true;
+        super.create();
+        this.bgColor = 0x00000000;
+
+        validReplayPaths = [];
+        
+        for (path in Save.instance.modOptions.get(savePath))
+        {
+            if (FileUtil.doesFileExist(path)) validReplayPaths.push(path);
+        }
+
+        Save.instance.modOptions.set(savePath, validReplayPaths);
+        Save.instance.flush();
+
+        camFocusPoint = new FlxObject(0, 0);
+        FlxG.camera.follow(camFocusPoint, null, 0.06);
+        add(camFocusPoint);
+
+        var menuBG = new FlxSprite().loadGraphic(Paths.image('menuDesat'));
+        menuBG.color = 0xFFDF7411;
+        menuBG.setGraphicSize(Std.int(menuBG.width * 1.1));
+        menuBG.updateHitbox();
+        menuBG.screenCenter();
+        menuBG.scrollFactor.set(0, 0);
+        add(menuBG);
+
+        items = new TextMenuList();
+        items.onChange.add(onMenuChange);
+        add(items);
+
+        var descBox = new FlxSprite().makeGraphic(350, 300, 0xFF000000);
+		descBox.alpha = 0.6;
+        descBox.scrollFactor.set();
+        descBox.screenCenter(0x10);
+        descBox.y += 150;
+        descBox.x = FlxG.width - descBox.width;
+		if (validReplayPaths.length > 0) add(descBox);
+
+        descTxt = new FlxText(descBox.x + 5, descBox.y + 5, descBox.width - 10, "Put desc here", 16);
+		descTxt.setFormat(Paths.font("vcr.ttf"), 24, 0xFFFFFFFF, "left", FlxG.state.leftWatermarkText.borderStyle, 0xFF000000); //workaround for the borderstyle enum
+		descTxt.scrollFactor.set();
+		if (validReplayPaths.length > 0) add(descTxt);
+
+        var notifBox = new FlxSprite().makeGraphic(FlxG.width, 32, 0xFF000000);
+        notifBox.alpha = 0.6;
+        notifBox.scrollFactor.set();
+        add(notifBox);
+
+        var notifTxt = new FlxText(notifBox.x + 10, notifBox.y, FlxG.width - 20, "Note: Replays may not be 100% accurate to your original Gameplay!");
+        notifTxt.setFormat(Paths.font("vcr.ttf"), 32, 0xFFFFFFFF, "center", FlxG.state.leftWatermarkText.borderStyle, 0xFF000000);
+		notifTxt.scrollFactor.set();
+		notifTxt.borderSize = 2.4;
+		add(notifTxt);
+
+        replayPreviews = new FlxTypedGroup();
+        add(replayPreviews);
+
+        if (validReplayPaths.length == 0)
+        {
+            createItem("No Replays Available.", function() 
+            {
+                FunkinSound.playOnce(Paths.sound('cancelMenu'));
+            }, true); //simple way of preventing a crash
+        }
+        else 
+        {
+            var prefix:String = inputRecorderModule.scriptGet("REPLAY_FOLDER") + "/replay-";
+            var suffix:String = inputRecorderModule.scriptGet("REPLAY_EXT");
+
+            for (path in validReplayPaths)
+            {
+                var allZipEntries = FileUtil.readZIPFromBytes(FileUtil.readBytesFromPath(path));
+
+                for (file in allZipEntries)
+                {
+                    if (file.fileName == "data.json")
+                    {
+                        var replay = Json.parse(file.data.toString());
+                        var replayName:String = replay.songId + " (" + replay.diff + ", " + replay.variation + ")";
+        
+                        if (replay.songName != null)
+                            replayName = replay.songName + " (" + replay.diff + ")";
+        
+                        if (replay.date == null)
+                            replay.date = StringTools.stripSuffix(StringTools.stripPrefix(path, prefix), suffix);
+        
+                        allReplayDatas.push(replay);
+        
+                        createItem(replayName, function() 
+                        {
+                            var song = SongRegistry.instance.fetchEntry(replay.songId);
+                            if (song == null) return; 
+        
+                            inputRecorderModule.scriptSet("currentReplay", replay);
+                            inputRecorderModule.scriptSet("curMode", inputRecorderModule.scriptGet("REPLAY_MODE_REPLAY"));
+        
+                            FlxG.random.initialSeed = replay.seed;
+                            PlayStatePlaylist.isStoryMode = replay.story; 
+                            PlayStatePlaylist.campaignId = replay.levelId;
+                            Paths.setCurrentLevel(replay.levelId);
+        
+                            LoadingState.loadPlayState(
+                            {
+                                targetSong: song,
+                                targetDifficulty: replay.diff,
+                                targetVariation: replay.variation,
+                                targetInstrumental: replay.inst,
+                                practiceMode: replay.practice,
+                                minimalMode: replay.minimal,
+                                startTimestamp: replay.start,
+                                playbackRate: replay.rate,
+                                cameraFollowPoint: replay.camFollow.length != 2 ? null : new FlxPoint(replay.camFollow[0], replay.camFollow[1])
+                            }, true);
+                        });
+                    }
+
+                    if (file.fileName == "preview.png")
+                    {
+                        var bitmap = BitmapData.fromImage(Image.fromBytes(file.data));
+                        var previewImage = new FlxSprite().loadGraphic(bitmap);
+                        previewImage.setGraphicSize(Std.int(FlxG.width / 4), Std.int(FlxG.height / 4));
+                        previewImage.updateHitbox();
+                        previewImage.scrollFactor.set();
+                        previewImage.screenCenter();
+                        previewImage.y -= 125;
+                        previewImage.x += 450;
+                        previewImage.angle = FlxG.random.int(-10, 10);
+                        replayPreviews.add(previewImage);
+                    }
+                }
+            }
+        }
+
+        onMenuChange(items.members[0]);
+        FlxG.camera.focusOn(new FlxPoint(camFocusPoint.x, camFocusPoint.y + 500));
+    }
+
+    override function update(elapsed:Float)
+    {
+        super.update(elapsed);
+      
+        if (this.controls.BACK)
+        {
+            FunkinSound.playOnce(Paths.sound('cancelMenu'));
+            this.close();
+        }
+
+        if (FlxG.keys.justPressed.DELETE) //No way for me to currently delete files, this is the 2nd best thing
+        {
+            WindowUtil.openSelectFile(validReplayPaths[items.selectedIndex]);
+        }
+    }
+
+    function createItem(name:String, callback:Void->Void, fireInstantly = false)
+    {
+        var item = items.createItem(15, 100 + items.length * 100, name, "default", callback);
+        item.fireInstantly = fireInstantly;
+        //item.screenCenter(0x01); //X in FlxAxes
+        return item;
+    }
+
+    function onMenuChange(selected:TextMenuItem)
+    {
+        camFocusPoint.setPosition(FlxG.width / 2, selected.y + selected.height / 2);
+
+        var dataToUse = allReplayDatas[items.selectedIndex];
+        var dateStuff = dataToUse.date.split("-");
+
+        descTxt.text = 
+        "Date: " + dateStuff[0] + "-" + dateStuff[1] + "-" + dateStuff[2] + " at " + dateStuff[3] + ":" + dateStuff[4] + ":" + dateStuff[5] + 
+        "\nTotal Inputs: " + dataToUse.inputs.length + 
+        "\nScore: " + (dataToUse.scores?.score == null ? "N/A" : "" + dataToUse.scores.score) + 
+        "\nSicks: " + (dataToUse.scores?.sick == null ? "N/A" : "" + dataToUse.scores.sick) + 
+        "\nGood: " + (dataToUse.scores?.good == null ? "N/A" : "" + dataToUse.scores.good) + 
+        "\nBad: " + (dataToUse.scores?.bad == null ? "N/A" : "" + dataToUse.scores.bad) + 
+        "\nShit: " + (dataToUse.scores?.shit == null ? "N/A" : "" + dataToUse.scores.shit) + 
+        "\nMissed: " + (dataToUse.scores?.missed == null ? "N/A" : "" + dataToUse.scores.missed) + 
+        "\nMax Combo: " + (dataToUse.scores?.maxCombo == null ? "N/A" : "" + dataToUse.scores.maxCombo) + 
+        "\nTotal Notes Hit: " + (dataToUse.scores?.totalNotesHit == null ? "N/A" : "" + dataToUse.scores.totalNotesHit);
+
+        for (member in replayPreviews.members)
+            FlxTween.globalManager.completeTweensOf(member);
+
+        var scrolled:Int =  scrolledStatus(prevSelected, items.selectedIndex, items.length);
+
+        if (scrolled == -1) //upwards scroll
+        {
+            //Remove the object from the group but keep it in the state so we can actually see the damn tween
+            var previewSpr = replayPreviews.remove(replayPreviews.members[replayPreviews.length - 1], true);
+            add(previewSpr);
+
+            FlxTween.tween(previewSpr, {x: previewSpr.x + 450}, 0.33, 
+            {
+                ease: FlxEase.quartOut, 
+                onComplete: function(_) 
+                {
+                    previewSpr.screenCenter();
+                    previewSpr.y -= 125;
+                    previewSpr.x += 450;
+                    
+                    remove(previewSpr);
+                    replayPreviews.insert(0, previewSpr);
+                } 
+            });
+        }
+        else if (scrolled == 1) //downwards scroll
+        {
+            var previewSpr = replayPreviews.remove(replayPreviews.members[0], true);
+            replayPreviews.add(previewSpr);
+            previewSpr.x += 450;
+            FlxTween.tween(previewSpr, {x: previewSpr.x - 450}, 0.33, {ease: FlxEase.quartOut});
+        }
+
+        prevSelected = items.selectedIndex;
+    }
+
+    function scrolledStatus(previous:Int, next:Int, size:Int)
+    {
+        if (previous == next) return 0;
+
+        if (Math.abs(previous - next) < size - 1) //a simple calculation
+        {
+            return (next > previous ? 1 : -1);
+        }
+       
+        // Next is technically bigger than previous, however due to the wrap, the movement should be classified as "up"
+        if (next == size - 1 && previous == 0)
+            return -1;
+
+        // Previous is technically bigger than next, however due to the wrap, the movement should be classified as "down"
+        if (next == 0 && previous == size - 1)
+            return 1;
+
+        return 0;
+    }   
+}

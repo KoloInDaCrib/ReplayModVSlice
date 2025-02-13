@@ -1,0 +1,14 @@
+{
+  "title": "Funkin Replay Mod",
+  "description": "A Mod that saves player's Inputs after a Song Completion and allows them to view the Recording as a Replay.",
+  "contributors": [
+    {
+      "name": "Kolo",
+      "role": "Programmer",
+      "url": "https://x.com/KoloInDaCrib"
+    }
+  ],
+  "api_version": "0.5.0",
+  "mod_version": "1.0.0",
+  "license": "Apache-2.0"
+}

@@ -1,0 +1,643 @@
+import flixel.addons.transition.FlxTransitionableState;
+import flixel.math.FlxMath;
+import flixel.text.FlxText;
+import flixel.util.FlxStringUtil;
+import flixel.FlxG;
+import flixel.FlxSprite;
+import funkin.data.event.SongEventRegistry;
+import funkin.input.PreciseInputManager;
+import funkin.modding.base.ScriptedMusicBeatSubState;
+import funkin.modding.module.Module;
+import funkin.play.cutscene.VideoCutscene;
+import funkin.play.PauseSubState;
+import funkin.play.PlayState;
+import funkin.play.PlayStatePlaylist;
+import funkin.save.Save;
+import funkin.util.DateUtil;
+import funkin.util.FileUtil;
+import funkin.util.ReflectUtil;
+import funkin.ui.mainmenu.MainMenuState;
+import funkin.ui.options.OptionsState;
+import funkin.ui.transition.StickerSubState;
+import funkin.Conductor;
+import funkin.Highscore;
+import funkin.Paths;
+import openfl.display.BitmapData;
+import openfl.events.KeyboardEvent;
+import haxe.io.Path;
+import haxe.Json;
+import StringTools;
+import Std;
+
+
+/**
+ * Records Inputs and also does Replaying!
+ * Programmed by Kolo yadda yadda the stage editor guy
+ */
+class InputRecorder extends Module
+{
+	/**
+	 * The folder in which the replays are located.
+	 */
+	var REPLAY_FOLDER:String = "replays"; 
+
+	/**
+	 * The legacy file extension for replays, which were essentially just renamed .json files.
+	 */
+	var REPLAY_EXT_LEGACY:String = "rep";
+
+	/**
+	 * The file extension for replays, structured like .zip files.
+	 */
+	var REPLAY_EXT:String = "fnfr"; 
+
+	/**
+	 * The key in the save's map where replay file paths are saved, since I can't read directories at the moment.
+	 */
+	var REPLAY_SAVE_PATHS:String = "replays_replayPaths"; 
+
+	/**
+	 * The key in the save's map where the value of the option to record replays is located.
+	 */
+	var REPLAY_SAVE_ENABLED:String = "replays_replayEnabled";
+
+	/**
+	 * The Replay Mode representing doing nothing.
+	 */
+	var REPLAY_MODE_NONE:Int = 0; 
+
+	/**
+	 * The Replay Mode to indicate that the current action is recording.
+	 */
+	var REPLAY_MODE_RECORD:Int = 1;
+
+	/**
+	 * The Replay Mode to indicate that the current action is replaying.
+	 */
+	var REPLAY_MODE_REPLAY:Int = 2; 
+
+	/**
+	 * An array of controls that would be blacklisted from being saved in the final replay data.
+	 */
+	var BLACKLIST_CONTROLS_RECORD:Array<String> = UI_KEYS.concat(MENU_KEYS.concat(MISC_KEYS));
+
+	/**
+	 * An array of controls that the system wouldn't block when in the replaying action.
+	 */
+	var BLACKLIST_CONTROLS_REPLAY:Array<String> = UI_KEYS_REPLAY.concat(MENU_KEYS.concat(MISC_KEYS)); 
+
+	function new() 
+	{
+		super("InputRecorder", FlxMath.MAX_VALUE_INT); //do it last cuz other modules may want to have a cutscene at the end of the song so we don't wanna disrupt that
+	}
+
+	override function onCreate(event) //set all the save stuff up, as well as do migration!
+	{
+		FileUtil.createDirIfNotExists(REPLAY_FOLDER);
+
+		if (!Save.instance.modOptions.exists(REPLAY_SAVE_PATHS) || !Save.instance.modOptions.exists(REPLAY_SAVE_ENABLED))
+		{
+			Save.instance.modOptions.set(REPLAY_SAVE_PATHS, []);
+			Save.instance.modOptions.set(REPLAY_SAVE_ENABLED, true);
+			Save.instance.flush();
+		}
+
+		var noPreviewSprite:FlxSprite = new FlxSprite().loadGraphic(Paths.image("noPreview"));
+
+		//migrate old virgin legacy replay files to new chad replay files
+		var replacerFiles:Array<String> = [];
+		for (path in Save.instance.modOptions.get(REPLAY_SAVE_PATHS))
+		{
+			if (!FileUtil.doesFileExist(path)) continue;
+			if (!Path.extension(REPLAY_EXT_LEGACY)) 
+			{
+				replacerFiles.push(path);
+				continue;
+			}
+
+			var data = FileUtil.readStringFromPath(path);
+			var fileName = StringTools.replace(path, "." + REPLAY_EXT_LEGACY, "." + REPLAY_EXT);
+			replacerFiles.push(fileName);
+			
+			FileUtil.saveFilesAsZIPToPath([FileUtil.makeZIPEntry("data.json", data), FileUtil.makeZIPEntryFromBytes("preview.png", noPreviewSprite.pixels.image.encode())], fileName);
+		}
+
+		Save.instance.modOptions.set(REPLAY_SAVE_PATHS, replacerFiles);
+		Save.instance.flush();
+
+		noPreviewSprite.destroy();
+	}
+
+	var curMode:Int = REPLAY_MODE_NONE;
+	var currentReplay:InputFileData = null;
+	var allInputsCopy:Array<KeyInputData> = []; //copy of all the inputs since we're using shift() to remove them
+	var sprRec:FlxSprite;
+	
+	var takePreviewTime:Int = -1;
+	var previewSprite:FlxSprite = null;
+
+	var leavingReplay:Bool = false; //open substate after leaving replay
+	var totalElapsed:Float = 0; //used for toggling the sprRec's visibility (via trig functions!)
+	var allowedReplayControls:Array<Int> = []; //keycodes of the controls allowed to be used during replays
+
+	var skipTimeTxt:FlxText = null;
+	var timeToSkipTo:Float = 0;
+	var timeSkipHoldTimer:Float = 0;
+
+	override function onCountdownStart(event) //start the replay whatever
+	{
+		super.onCountdownStart(event);
+		if (curMode == REPLAY_MODE_NONE && currentReplay != null) return; //We have initiated a replay, but due to a cutscene, haven't started the gameplay
+
+		restoreEvents();
+		takePreviewTime = -1;
+		previewSprite = null;
+
+		if (PlayState.instance == null || PlayState.instance.isBotPlayMode || PlayState.instance.isSubState) return;
+
+		sprRec = new FlxSprite(0, -45);
+		sprRec.cameras = [PlayState.instance.camHUD];
+		sprRec.zIndex = 1100;
+		sprRec.scale.set(0.5, 0.5);
+		sprRec.updateHitbox();
+		PlayState.instance.add(sprRec);
+		PlayState.instance.refresh();
+
+		if (curMode == REPLAY_MODE_NONE && Save.instance.modOptions.get(REPLAY_SAVE_ENABLED)) 
+		{
+			curMode = REPLAY_MODE_RECORD;
+			var prevPointNull = PlayState.instance.previousCameraFollowPoint == null;
+			currentReplay =
+			{
+				songId: PlayState.instance.currentSong.id,
+				songName: PlayState.instance.currentChart.songName,
+				diff: PlayState.instance.currentDifficulty,
+				variation: PlayState.instance.currentVariation,
+				inst: PlayState.instance.currentInstrumental == null ? "" : PlayState.instance.currentInstrumental,
+				practice: PlayState.instance.isPracticeMode,
+				minimal: PlayState.instance.isMinimalMode,
+				start: PlayState.instance.startTimestamp,
+				rate: PlayState.instance.playbackRate,
+				camFollow: prevPointNull ? [] : [PlayState.instance.previousCameraFollowPoint.x, PlayState.instance.previousCameraFollowPoint.y],
+				story: PlayStatePlaylist.isStoryMode,
+				inputs: [],
+				seed: FlxG.random.initialSeed,
+				scores: 
+				{
+					shit: 0,
+					bad: 0,
+					good: 0,
+					sick: 0,
+					missed: 0,
+					maxCombo: 0,
+					score: 0,
+					totalNotesHit: 0
+				},
+				date: ""
+			};
+
+			FlxG.stage.application.window.onKeyDownPrecise.add(handleKeyDown);
+			FlxG.stage.application.window.onKeyUpPrecise.add(handleKeyUp);
+
+			sprRec.loadGraphic(Paths.image("record"));
+			sprRec.x = FlxG.width - sprRec.width + 75;
+		}
+		else if (curMode == REPLAY_MODE_REPLAY)
+		{
+			allInputsCopy = currentReplay.inputs.copy();
+			allowedReplayControls = [];
+
+			FlxG.stage.application.window.onKeyUpPrecise.removeAll();
+			FlxG.stage.application.window.onKeyDownPrecise.removeAll();
+
+			@:privateAccess  //ban every key except those in BLACKLIST_CONTROLS_REPLAY from being usable
+			{
+				FlxG.stage.removeEventListener(KeyboardEvent.KEY_DOWN, FlxG.keys.onKeyDown);
+				FlxG.stage.removeEventListener(KeyboardEvent.KEY_UP, FlxG.keys.onKeyUp);
+				FlxG.stage.addEventListener(KeyboardEvent.KEY_DOWN, handleReplayKeyDown);
+				FlxG.stage.addEventListener(KeyboardEvent.KEY_UP, handleReplayKeyUp);
+
+				for (action in FlxG.state.controls.digitalActions)
+				{
+					if (!BLACKLIST_CONTROLS_REPLAY.contains(action.name.toUpperCase())) continue;
+
+					for (input in action.inputs)
+					{
+						if (Std.string(input.device) != "KEYBOARD") continue;
+						allowedReplayControls.push(input.inputID);
+					}
+				}
+			}
+			
+			sprRec.loadGraphic(Paths.image("replay"));
+			sprRec.x = FlxG.width - sprRec.width + 75;
+		}
+
+		totalElapsed = 0;
+	}
+
+	override function onUpdate(event) //the main sauce
+	{
+		super.onUpdate(event);
+
+		//sprRec neat tween
+		if (curMode != REPLAY_MODE_NONE && sprRec != null) 
+		{
+			totalElapsed += event.elapsed * 5;
+			sprRec.visible = (Math.cos(totalElapsed) > 0);
+		}
+		
+		//the part where it does the replay
+		if (curMode == REPLAY_MODE_REPLAY) 
+		{
+			while (allInputsCopy.length > 0 && allInputsCopy[0].mark <= Conductor.instance.songPosition - Conductor.instance.combinedOffset)
+			{
+				var curInput = allInputsCopy.shift();
+
+				@:privateAccess 
+				{
+					var convertedKeyCode = PreciseInputManager.convertKeyCode(curInput.keyID);
+					if (!allowedReplayControls.contains(convertedKeyCode)) FlxG.keys.updateKeyStates(convertedKeyCode, curInput.down);
+
+					if (curInput.down)
+					{
+						PreciseInputManager.instance.handleKeyDown(curInput.keyID, curInput.mod, PreciseInputManager.getCurrentTimestamp() / PreciseInputManager.NS_PER_MS);
+					}
+					else 
+					{
+						PreciseInputManager.instance.handleKeyUp(curInput.keyID, curInput.mod, PreciseInputManager.getCurrentTimestamp() / PreciseInputManager.NS_PER_MS);
+					}	
+				}
+			}
+		}
+
+		//take a gameplay preview picture at a random point in time
+		if (curMode == REPLAY_MODE_RECORD && FlxG.sound.music != null) 
+		{
+			if (takePreviewTime < 0)
+			{
+				takePreviewTime = FlxG.random.int(0, FlxG.sound.music.length - 1000);
+			}
+
+			if (FlxG.sound.music.time >= takePreviewTime && previewSprite == null)
+			{
+				previewSprite = new FlxSprite().loadGraphic(BitmapData.fromImage(FlxG.stage.window.readPixels()));
+			}
+		}
+		
+		//main menu stuff with the submenu
+		if (Std.isOfType(FlxG.state, MainMenuState) && FlxG.state.subState == null) 
+		{
+			FlxG.state.rightWatermarkText.text = "Press G to open the Menu with all Replays."; //insert one of those cool ass skeleton images with the letter g highlighted
+
+			if (FlxG.keys.justPressed.G)
+			{
+				openViewerSubState(FlxG.state, null);
+			}
+		}
+
+		//controls the text behind setting the replay time for the pause menu
+		if (curMode == REPLAY_MODE_REPLAY && Std.isOfType(FlxG.state.subState, PauseSubState) && skipTimeTxt != null) 
+		{
+			if (FlxG.state.subState.currentEntry == 2)
+			{
+				if (FlxG.state.subState.controls.UI_LEFT_P)
+				{
+					timeToSkipTo -= 1000;
+					timeSkipHoldTimer = 0;
+				}
+				if (FlxG.state.subState.controls.UI_RIGHT_P)
+				{
+					timeToSkipTo += 1000;
+					timeSkipHoldTimer = 0;
+				}
+				if(FlxG.state.subState.controls.UI_LEFT || FlxG.state.subState.controls.UI_RIGHT)
+				{
+					timeSkipHoldTimer += event.elapsed;
+					if(timeSkipHoldTimer > 0.5)
+						timeToSkipTo += 45000 * event.elapsed * (FlxG.state.subState.controls.UI_LEFT ? -1 : 1);
+				}
+			}
+
+			if(timeToSkipTo >= FlxG.sound.music.length) timeToSkipTo -= FlxG.sound.music.length;
+			else if(timeToSkipTo < 0) timeToSkipTo += FlxG.sound.music.length;
+
+			var skipTimeTracker = FlxG.state.subState.menuEntryText.members[2];
+			skipTimeTxt.x = skipTimeTracker.x + skipTimeTracker.width + 60;
+			skipTimeTxt.y = skipTimeTracker.y;
+			skipTimeTxt.visible = (FlxG.state.subState.currentEntry == 2);
+
+			skipTimeTxt.text = FlxStringUtil.formatTime(Math.max(0, Math.floor(timeToSkipTo / 1000)), false) + "/" + FlxStringUtil.formatTime(Math.max(0, Math.floor(FlxG.sound.music.length / 1000)), false);
+		}
+	}
+
+	var stickerSubState = null;
+
+	override function onStateChangeEnd(event) //adds an option to enable input recording
+	{
+		if (Std.isOfType(event.targetState, OptionsState))
+		{
+			@:privateAccess
+			{
+				event.targetState.pages["preferences"].createPrefItemCheckbox('Enable Recording', 'Enables the Recording Process of Replays.', function(value:Bool):Void {
+					Save.instance.modOptions.set(REPLAY_SAVE_ENABLED, value);
+					Save.instance.flush();
+				  }, Save.instance.modOptions.get(REPLAY_SAVE_ENABLED));
+			}
+		}
+		if (Std.isOfType(event.targetState, MainMenuState) && leavingReplay)
+		{
+			leavingReplay = false;
+			openViewerSubState(event.targetState, stickerSubState);
+		}
+	}
+
+	function openViewerSubState(state, stickers)
+	{
+		var subState = ScriptedMusicBeatSubState.init("InputViewer"); //shoutouts abnormalpoof for funker selector because otherwise i wouldn't know how to do this lol
+		state.persistentUpdate = false;
+		state.openSubState(subState);
+
+		if (stickers != null)
+		{
+			subState.openSubState(stickers);
+			stickers.degenStickers();
+		}
+	}
+
+	override function onSongRetry(event) //resets the state of the recording
+	{
+		if (curMode == REPLAY_MODE_RECORD) 
+		{
+			curMode = REPLAY_MODE_NONE;
+			currentReplay = null;
+		}
+	}
+
+	override function onStateChangeBegin(event) //disables the replay if we leave the game through game over/pause menu/whatever
+	{
+		if (curMode == REPLAY_MODE_REPLAY && Std.isOfType(FlxG.state, PlayState)) 
+		{
+			leavingReplay = true;
+			curMode = REPLAY_MODE_NONE;
+			currentReplay = null;
+			restoreEvents();
+		}
+		else if (curMode == REPLAY_MODE_RECORD) 
+		{
+			curMode = REPLAY_MODE_NONE;
+			currentReplay = null;
+
+			FlxG.stage.application.window.onKeyDownPrecise.remove(handleKeyDown);
+			FlxG.stage.application.window.onKeyUpPrecise.remove(handleKeyUp);
+		}
+	}
+
+	//override some pause menu options for replays, so that we don't have the option to switch difficulties during replay
+	override function onSubStateOpenEnd(event) 
+	{
+		if (Std.isOfType(event.targetState, PauseSubState) && curMode == REPLAY_MODE_REPLAY) 
+		{
+			@:privateAccess 
+			{
+				if (PlayState.instance.currentConversation != null || VideoCutscene.isPlaying()) return;
+
+				event.targetState.resetSelection();
+				event.targetState.currentMenuEntries = [
+				{text: 'Resume', callback: PauseSubState.PAUSE_MENU_ENTRIES_STANDARD[0].callback},
+				{text: 'Restart', callback: PauseSubState.PAUSE_MENU_ENTRIES_STANDARD[1].callback},
+				{text: 'Skip to Time', callback: function(state) 
+					{
+						if (FlxG.sound.music != null)
+						{
+							Conductor.instance.update(timeToSkipTo);
+							PlayState.instance.handleSkippedNotes();
+							SongEventRegistry.handleSkippedEvents(PlayState.instance.songEvents, Conductor.instance.songPosition);
+
+							allInputsCopy = currentReplay.inputs.copy();
+
+							while (allInputsCopy.length > 0 && allInputsCopy[0].mark <= Conductor.instance.songPosition - Conductor.instance.combinedOffset)
+								allInputsCopy.shift();
+							
+							state.close();
+						}
+					}
+				},
+				{text: "Quit", callback: function(state)
+					{
+						state.allowInput = false;
+						PlayState.instance.deathCounter = 0;
+
+						FlxTransitionableState.skipNextTransIn = true;
+						FlxTransitionableState.skipNextTransOut = true;
+
+						stickerSubState = new StickerSubState(null, (sticker) -> new MainMenuState());
+						state.openSubState(stickerSubState);
+					}
+				}];
+
+				if (FlxG.sound.music == null)
+				{
+					event.targetState.currentMenuEntries.remove(event.targetState.currentMenuEntries[2]);
+				}
+
+				event.targetState.clearAndAddMenuEntries();
+				event.targetState.metadataDeaths.text = "Viewing Replay";
+				event.targetState.changeSelection();
+
+				if (FlxG.sound.music != null)
+				{
+					skipTimeTxt = new FlxText(0, 0, 0, 'tate', 64);
+					skipTimeTxt.setFormat(Paths.font("vcr.ttf"), 64, 0xFFFFFFFF, "center", FlxG.state.leftWatermarkText.borderStyle, 0xFF000000);
+					skipTimeTxt.scrollFactor.set();
+					skipTimeTxt.borderSize = 4;
+
+					event.targetState.add(skipTimeTxt);
+					timeToSkipTo = FlxG.sound.music.time;
+				}
+			}
+		}
+	}
+
+	//save the replay when the song ends or bring back to the input viewer state after finishing a replay, depending on the current action
+	override function onSongEnd(event) 
+	{
+		if (curMode == REPLAY_MODE_REPLAY) 
+		{
+			event.cancel(); 
+			stickerSubState = new StickerSubState(null, (sticker) -> new MainMenuState());
+			FlxG.state.openSubState(stickerSubState);
+		}
+
+		if (currentReplay != null && curMode == REPLAY_MODE_RECORD)
+		{
+			currentReplay.scores.shit = Highscore.tallies.shit;
+			currentReplay.scores.bad = Highscore.tallies.bad;
+			currentReplay.scores.good = Highscore.tallies.good;
+			currentReplay.scores.sick = Highscore.tallies.sick;
+			currentReplay.scores.missed = Highscore.tallies.missed;
+			currentReplay.scores.maxCombo = Highscore.tallies.maxCombo;
+			currentReplay.scores.score = PlayState.instance.songScore;
+			currentReplay.scores.totalNotesHit = Highscore.tallies.totalNotesHit;
+			currentReplay.date = DateUtil.generateTimestamp();
+
+			var path:String = REPLAY_FOLDER + "/replay-" + currentReplay.date + "." + REPLAY_EXT;
+			var content:String = Json.stringify(currentReplay, null, '  ');
+
+			var entries = [FileUtil.makeZIPEntry("data.json", content), FileUtil.makeZIPEntryFromBytes("preview.png", previewSprite.pixels.image.encode())];
+			FileUtil.saveFilesAsZIPToPath(entries, path);
+
+			var replayPaths:Array<String> = [path].concat(Save.instance.modOptions.get(REPLAY_SAVE_PATHS));
+			Save.instance.modOptions.set(REPLAY_SAVE_PATHS, replayPaths);
+			Save.instance.flush();
+
+			previewSprite.destroy();
+			currentReplay = null;
+		}
+	}
+
+	//restore events and kill off sprRec
+	function restoreEvents() 
+	{
+		FlxG.random.resetInitialSeed();
+
+		FlxG.stage.application.window.onKeyUpPrecise.removeAll();
+		FlxG.stage.application.window.onKeyDownPrecise.removeAll();
+		FlxG.stage.application.window.onKeyDownPrecise.add(FlxG.stage.application.window.application.onKeyDownPrecise);
+		FlxG.stage.application.window.onKeyUpPrecise.add(FlxG.stage.application.window.application.onKeyUpPrecise);
+
+		@:privateAccess
+		{
+			FlxG.stage.application.window.onKeyDownPrecise.add(PreciseInputManager.instance.handleKeyDown);
+			FlxG.stage.application.window.onKeyUpPrecise.add(PreciseInputManager.instance.handleKeyUp);
+
+			FlxG.stage.addEventListener(KeyboardEvent.KEY_DOWN, FlxG.keys.onKeyDown);
+			FlxG.stage.addEventListener(KeyboardEvent.KEY_UP, FlxG.keys.onKeyUp);
+			FlxG.stage.removeEventListener(KeyboardEvent.KEY_DOWN, handleReplayKeyDown);
+			FlxG.stage.removeEventListener(KeyboardEvent.KEY_UP, handleReplayKeyUp);
+		}
+
+		if (sprRec != null)
+		{
+			sprRec.kill();
+			PlayState.instance.remove(sprRec, true);
+			sprRec.destroy();
+		}
+	}
+
+	//these are there to not clutter up the blacklist keys array
+	var UI_KEYS:Array<String> = [
+		"UI_UP", "UI_LEFT", "UI_RIGHT", "UI_DOWN", 
+		"UI_UP_P", "UI_LEFT_P", "UI_RIGHT_P", "UI_DOWN_P", 
+		"UI_UP_R", "UI_LEFT_R", "UI_RIGHT_R", "UI_DOWN_R", 
+		"UI_UP_GAMEPAD", "UI_LEFT_GAMEPAD", "UI_RIGHT_GAMEPAD", "UI_DOWN_GAMEPAD"
+	];
+
+	var UI_KEYS_REPLAY:Array<String> = ["UI_UP", "UI_LEFT", "UI_RIGHT", "UI_DOWN"];
+	var MENU_KEYS:Array<String> = ["ACCEPT", "BACK", "PAUSE", "RESET", "VOLUME_UP", "VOLUME_DOWN", "VOLUME_MUTE"];
+	var MISC_KEYS:Array<String> = ["WINDOW_FULLSCREEN", "WINDOW_SCREENSHOT", "CUTSCENE_ADVANCE", "DEBUG_CHART", "DEBUG_STAGE"];
+
+	//handlers
+	function handleKeyDown(keyCode, _, timestamp)
+	{	
+		if (currentReplay == null || curMode != REPLAY_MODE_RECORD) return;
+
+		if (isABlacklistedControlActive()) return;
+
+		currentReplay.inputs.push(
+		{
+			keyID: Std.int(keyCode),
+			mod:  Std.int(_),
+			mark: Conductor.instance.songPosition - Conductor.instance.combinedOffset, 
+			down: true
+		});
+	}
+
+	function handleKeyUp(keyCode, _, timestamp):Void
+	{
+		if (currentReplay == null || curMode != REPLAY_MODE_RECORD) return;
+
+		if (isABlacklistedControlActive()) return;
+
+		currentReplay.inputs.push(
+		{
+			keyID: Std.int(keyCode),
+			mod:  Std.int(_),
+			mark: Conductor.instance.songPosition - Conductor.instance.combinedOffset,
+			down: false
+		});
+	}
+
+	function handleReplayKeyDown(event)
+	{
+		@:privateAccess
+		{
+			if (allowedReplayControls.contains(event.keyCode)) FlxG.keys.onKeyDown(event);
+		}
+	}
+
+	function handleReplayKeyUp(event)
+	{
+		@:privateAccess
+		{
+			if (allowedReplayControls.contains(event.keyCode)) FlxG.keys.onKeyUp(event);
+		}
+	}
+
+	function isABlacklistedControlActive()
+	{
+		if (curMode != REPLAY_MODE_RECORD) return false;
+
+		for (key in BLACKLIST_CONTROLS_RECORD)
+		{
+			if (ReflectUtil.hasAnonymousField(FlxG.state.controls, key) && ReflectUtil.getAnonymousField(FlxG.state.controls, key) == true)
+				return true;
+		}
+
+		return false;
+	}
+}
+
+// mostly a copy of playstateparams, except song is now string so we can put it into json files!
+// also there's no botplay data because recording that would be stupid
+typedef InputFileData =
+{
+	var songId:String;
+	var songName:String;
+	var levelId:String;
+	var diff:String; 
+	var variation:String;
+	var inst:String;
+	var practice:Bool;
+	var minimal:Bool;
+	var start:Float;
+	var rate:Float;
+	var camFollow:Array<Float>;
+	var story:Bool;
+
+	var inputs:Array<KeyInputData>;
+	var seed:Int;
+	var scores:InputScoreData;
+	var date:String;
+}
+
+typedef KeyInputData =
+{
+	var keyID:Int;
+	var mod:Int; //too bad I cannot use Int64
+	var mark:Float;
+	var down:Bool;
+} 
+
+//different from RawTallies since it doesn't save everything
+typedef InputScoreData = 
+{
+	var shit:Int;
+	var bad:Int;
+	var good:Int;
+	var sick:Int;
+	var missed:Int;
+	var maxCombo:Int;
+	var score:Int;
+	var totalNotesHit:Int;
+}
