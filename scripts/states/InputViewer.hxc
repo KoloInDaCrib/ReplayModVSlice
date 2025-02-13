@@ -198,7 +198,7 @@ class InputViewer extends MusicBeatSubState
             this.close();
         }
 
-        if (FlxG.keys.justPressed.DELETE) //No way for me to currently delete files, this is the 2nd best thing
+        if (FlxG.keys.justPressed.DELETE && validReplayPaths.length > 0) //No way for me to currently delete files, this is the 2nd best thing
         {
             WindowUtil.openSelectFile(validReplayPaths[items.selectedIndex]);
         }
