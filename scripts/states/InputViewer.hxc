@@ -1,3 +1,4 @@
+package replay;
 
 import flixel.addons.transition.FlxTransitionableState;
 import flixel.group.FlxTypedGroup;
@@ -5,6 +6,7 @@ import flixel.math.FlxPoint;
 import flixel.text.FlxText;
 import flixel.tweens.FlxTween;
 import flixel.tweens.FlxEase;
+import flixel.FlxCamera;
 import flixel.FlxG;
 import flixel.FlxObject;
 import flixel.FlxSprite;
@@ -17,13 +19,19 @@ import funkin.save.Save;
 import funkin.ui.MusicBeatSubState;
 import funkin.ui.TextMenuList;
 import funkin.ui.transition.LoadingState;
+import funkin.util.plugins.VolumePlugin;
 import funkin.util.tools.StringTools;
 import funkin.util.FileUtil;
+import funkin.util.FileWriteMode;
 import funkin.util.WindowUtil;
 import funkin.Paths;
+import lime.app.Application;
 import lime.graphics.Image;
+import lime.system.Clipboard;
 import openfl.display.BitmapData;
+import openfl.events.KeyboardEvent;
 import haxe.Json;
+import haxe.Utf8;
 import Std;
 
 /**
@@ -38,6 +46,7 @@ class InputViewer extends MusicBeatSubState
 
     var prevSelected:Int = -1;
     var camFocusPoint:FlxObject;
+    var camGame:FlxCamera;
     var items:TextMenuList;
 
     var inputRecorderModule:Module = ModuleHandler.getModule("InputRecorder");
@@ -48,6 +57,15 @@ class InputViewer extends MusicBeatSubState
     var allReplayDatas:Array<Dynamic> = [];
 
     var replayPreviews:FlxTypedGroup;
+    var curTweeningPreviews:Array<FlxSprite> = [];
+
+    var isRenaming:Bool = false;
+    var tabDown:Bool = false;
+    var caretSpr:FlxSprite;
+    var caretTime:Float = 0.0;
+    var canType:Bool = true; // used to fix a glitch that causes `keyDown` event to activate multiple times in a row
+    var allNames:Array<String> = []; // this is filled up upon the generation of items.
+    var volumePlugin:VolumePlugin; // will get disabled when the player starts typing, doing this prevents calling volume keys during typing
 
     public override function create() 
     {
@@ -65,8 +83,22 @@ class InputViewer extends MusicBeatSubState
         Save.instance.modOptions.set(savePath, validReplayPaths);
         Save.instance.flush();
 
+        for (plugin in FlxG.plugins.list)
+        {
+            if (Std.isOfType(plugin, VolumePlugin))
+            {
+                volumePlugin = plugin;
+                break;
+            }
+        }
+
+        camGame = new FlxCamera();
+        camGame.bgColor = 0x00000000;
+        FlxG.cameras.add(camGame);
+        this.cameras = [camGame];
+
         camFocusPoint = new FlxObject(0, 0);
-        FlxG.camera.follow(camFocusPoint, null, 0.06);
+        camGame.follow(camFocusPoint, null, 0.06);
         add(camFocusPoint);
 
         var menuBG = new FlxSprite().loadGraphic(Paths.image('menuDesat'));
@@ -105,8 +137,11 @@ class InputViewer extends MusicBeatSubState
 		notifTxt.borderSize = 2.4;
 		add(notifTxt);
 
-        replayPreviews = new FlxTypedGroup();
+        replayPreviews = new FlxTypedGroup(0, 0, validReplayPaths.length);
         add(replayPreviews);
+
+        caretSpr = new FlxSprite().makeGraphic(3, 1, 0xFF000000);
+        add(caretSpr);
 
         if (validReplayPaths.length == 0)
         {
@@ -129,29 +164,27 @@ class InputViewer extends MusicBeatSubState
                     if (file.fileName == "data.json")
                     {
                         var replay = Json.parse(file.data.toString());
-                        var replayName:String = replay.songId + " (" + replay.diff + ", " + replay.variation + ")";
-        
-                        if (replay.songName != null)
-                            replayName = replay.songName + " (" + replay.diff + ")";
-        
-                        if (replay.date == null)
-                            replay.date = StringTools.stripSuffix(StringTools.stripPrefix(path, prefix), suffix);
-        
+                        if (replay.date == null) replay.date = StringTools.stripSuffix(StringTools.stripPrefix(path, prefix), suffix);
+
+                        var replayName:String = formatReplayName(replay);
+                        allNames.push(replayName);
                         allReplayDatas.push(replay);
-        
-                        createItem(replayName, function() 
+
+                        var song = SongRegistry.instance.fetchEntry(replay.songId);
+                        var useFailCallback:Bool = (song == null || song.difficulties[replay.variation] == null || song.difficulties[replay.variation][replay.diff] == null);
+
+                        var successCallback:Void->Void = function() 
                         {
-                            var song = SongRegistry.instance.fetchEntry(replay.songId);
-                            if (song == null) return; 
-        
                             inputRecorderModule.scriptSet("currentReplay", replay);
                             inputRecorderModule.scriptSet("curMode", inputRecorderModule.scriptGet("REPLAY_MODE_REPLAY"));
-        
+                            inputRecorderModule.scriptSet("curSelectedReplay", items.selectedIndex);
+                            inputRecorderModule.scriptSet("replayName", items.selectedItem.label.text);
+            
                             FlxG.random.initialSeed = replay.seed;
                             PlayStatePlaylist.isStoryMode = replay.story; 
                             PlayStatePlaylist.campaignId = replay.levelId;
                             Paths.setCurrentLevel(replay.levelId);
-        
+            
                             LoadingState.loadPlayState(
                             {
                                 targetSong: song,
@@ -164,7 +197,23 @@ class InputViewer extends MusicBeatSubState
                                 playbackRate: replay.rate,
                                 cameraFollowPoint: replay.camFollow.length != 2 ? null : new FlxPoint(replay.camFollow[0], replay.camFollow[1])
                             }, true);
-                        });
+                        }
+
+                        var failCallback:Void->Void = function()
+                        {   
+                            FunkinSound.playOnce(Paths.sound('cancelMenu'));
+
+                            var alertMsg:String = "Could not find the Song for this Rreplay. We looked for: " +
+                            "\n\nSong ID: " + replay.songId +
+                            "\nVariation: " + replay.variation +
+                            "\nDifficulty: " + replay.diff + 
+                            "\n\nIf the song is modded, please check if the mod is loaded.";
+
+                            Application.current.window.alert(alertMsg, "Replay Mod");
+                        }
+
+                        // Using path for now because items in `MenuList` are stored in a Map by name (which can be overriden if the name exists) ffs
+                        createItem(path, useFailCallback ? failCallback : successCallback, useFailCallback);
                     }
 
                     if (file.fileName == "preview.png")
@@ -184,27 +233,71 @@ class InputViewer extends MusicBeatSubState
             }
         }
 
+        // Rename similarly named replays to get rid of the duplicates.
+        renameDuplicateReplays();
+
         onMenuChange(items.members[0]);
-        FlxG.camera.focusOn(new FlxPoint(camFocusPoint.x, camFocusPoint.y + 500));
+        camGame.focusOn(new FlxPoint(camFocusPoint.x, camFocusPoint.y + 500));
+
+        // As much as I would want to use something else, I have to account for preview images.
+        while (items.selectedIndex < inputRecorderModule.scriptGet("curSelectedReplay")) 
+        {
+            items.selectItem(items.selectedIndex + 1);
+        }
     }
 
     override function update(elapsed:Float)
     {
         super.update(elapsed);
-      
+
+        caretTime += elapsed;
+        caretSpr.visible = isRenaming && ((caretTime % 1.2) < 0.6);
+        caretSpr.x = items.selectedItem.x + items.selectedItem.label.getWidth();
+
+        canType = true;
+
+        items.enabled = !isRenaming;
+        volumePlugin.active = !isRenaming;
+        if (isRenaming) return;
+        
+        // Returning back to the main menu.
         if (this.controls.BACK)
         {
             FunkinSound.playOnce(Paths.sound('cancelMenu'));
+            inputRecorderModule.scriptSet("curSelectedReplay", items.selectedIndex);
+            FlxG.cameras.remove(camGame);
             this.close();
         }
 
-        if (FlxG.keys.justPressed.DELETE && validReplayPaths.length > 0) //No way for me to currently delete files, this is the 2nd best thing
+        // Replay file "deleting". No way for me to currently do this otherwise.
+        if (FlxG.keys.justPressed.DELETE && validReplayPaths.length > 0) 
         {
             WindowUtil.openSelectFile(validReplayPaths[items.selectedIndex]);
         }
+
+        // Mouse scrolling.
+        if (FlxG.mouse.wheel != 0)
+        {
+            var newIndex:Int = items.selectedIndex - (FlxG.mouse.wheel > 0 ? 1 : -1);
+            if (newIndex < 0) newIndex = items.length - 1;
+            else if (newIndex >= items.length) newIndex = 0;
+            
+            FunkinSound.playOnce(Paths.sound('scrollMenu'), 0.4);
+            items.selectItem(newIndex);
+        }
+
+        // Enabling the replay renaming mode.
+        if (FlxG.keys.justPressed.F2)
+        {
+            allNames = [for (item in items.members) item.label.text];
+            allNames.remove(items.selectedItem.label.text); //not so much *all*Names now, is it?
+
+            FlxG.stage.addEventListener("keyDown", renameReplay);
+            isRenaming = true;
+        }
     }
 
-    function createItem(name:String, callback:Void->Void, fireInstantly = false)
+    function createItem(name:String, callback:Void->Void, fireInstantly:Bool = false)
     {
         var item = items.createItem(15, 100 + items.length * 100, name, "default", callback);
         item.fireInstantly = fireInstantly;
@@ -215,12 +308,15 @@ class InputViewer extends MusicBeatSubState
     function onMenuChange(selected:TextMenuItem)
     {
         camFocusPoint.setPosition(FlxG.width / 2, selected.y + selected.height / 2);
+        if (validReplayPaths.length == 0) return;
 
         var dataToUse = allReplayDatas[items.selectedIndex];
         var dateStuff = dataToUse.date.split("-");
 
         descTxt.text = 
-        "Date: " + dateStuff[0] + "-" + dateStuff[1] + "-" + dateStuff[2] + " at " + dateStuff[3] + ":" + dateStuff[4] + ":" + dateStuff[5] + 
+        "Song: " + formatReplayName(dataToUse, true) + 
+        "\nDate: " + dateStuff[0] + "-" + dateStuff[1] + "-" + dateStuff[2] + 
+        "\nTime: " + dateStuff[3] + ":" + dateStuff[4] + ":" + dateStuff[5] + 
         "\nTotal Inputs: " + dataToUse.inputs.length + 
         "\nScore: " + (dataToUse.scores?.score == null ? "N/A" : "" + dataToUse.scores.score) + 
         "\nSicks: " + (dataToUse.scores?.sick == null ? "N/A" : "" + dataToUse.scores.sick) + 
@@ -231,40 +327,177 @@ class InputViewer extends MusicBeatSubState
         "\nMax Combo: " + (dataToUse.scores?.maxCombo == null ? "N/A" : "" + dataToUse.scores.maxCombo) + 
         "\nTotal Notes Hit: " + (dataToUse.scores?.totalNotesHit == null ? "N/A" : "" + dataToUse.scores.totalNotesHit);
 
-        for (member in replayPreviews.members)
-            FlxTween.globalManager.completeTweensOf(member);
-
-        var scrolled:Int =  scrolledStatus(prevSelected, items.selectedIndex, items.length);
+        var scrolled:Int = scrolledStatus(prevSelected, items.selectedIndex, items.length);
+        prevSelected = items.selectedIndex;
+        
+        var startOffset:Int = 0;
+        var endOffset:Int = 0;
+        var copyFrom:FlxSprite = null;
 
         if (scrolled == -1) //upwards scroll
         {
-            //Remove the object from the group but keep it in the state so we can actually see the damn tween
-            var previewSpr = replayPreviews.remove(replayPreviews.members[replayPreviews.length - 1], true);
-            add(previewSpr);
+            for (spr in curTweeningPreviews) FlxTween.globalManager.completeTweensOf(spr);
+            
+            copyFrom = replayPreviews.remove(replayPreviews.members[replayPreviews.length - 1], true);
+            replayPreviews.insert(0, copyFrom);
 
-            FlxTween.tween(previewSpr, {x: previewSpr.x + 450}, 0.33, 
-            {
-                ease: FlxEase.quartOut, 
-                onComplete: function(_) 
-                {
-                    previewSpr.screenCenter();
-                    previewSpr.y -= 125;
-                    previewSpr.x += 450;
-                    
-                    remove(previewSpr);
-                    replayPreviews.insert(0, previewSpr);
-                } 
-            });
+            endOffset = 450;
         }
         else if (scrolled == 1) //downwards scroll
         {
-            var previewSpr = replayPreviews.remove(replayPreviews.members[0], true);
-            replayPreviews.add(previewSpr);
-            previewSpr.x += 450;
-            FlxTween.tween(previewSpr, {x: previewSpr.x - 450}, 0.33, {ease: FlxEase.quartOut});
+            copyFrom = replayPreviews.remove(replayPreviews.members[0], true);
+            replayPreviews.add(copyFrom);
+
+            startOffset = 450;
+        }
+        else 
+        {
+            return; //No change, moving on!
         }
 
-        prevSelected = items.selectedIndex;
+        var previewSpr:FlxSprite = new FlxSprite(copyFrom.x + startOffset, copyFrom.y).loadGraphicFromSprite(copyFrom);
+        previewSpr.angle = copyFrom.angle;
+        previewSpr.setGraphicSize(Std.int(copyFrom.width), Std.int(copyFrom.height));
+        previewSpr.updateHitbox();
+        previewSpr.scrollFactor.set();
+        add(previewSpr);
+
+        curTweeningPreviews.push(previewSpr);
+        copyFrom.visible = false;
+
+        FlxTween.tween(previewSpr, {x: copyFrom.x + endOffset}, 0.33, 
+        {
+            ease: FlxEase.quartOut, 
+            onComplete: function(_) 
+            {
+                copyFrom.visible = true;
+                        
+                curTweeningPreviews.remove(previewSpr);
+                previewSpr.kill();
+                remove(previewSpr);
+                previewSpr.destroy();
+                previewSpr = null;
+            } 
+        });
+
+        caretSpr.setGraphicSize(Std.int(caretSpr.width), Std.int(items.selectedItem.label.maxHeight) - 4);
+        caretSpr.updateHitbox();
+        caretSpr.y = items.selectedItem.y + items.selectedItem.label.maxHeight / 2 - caretSpr.height / 2;
+    }
+
+    function renameDuplicateReplays()
+    {
+        var allNamesCopy:Array<String> = allNames.copy();
+        allNames = [];
+
+        while (allNamesCopy.length > 0)
+        {
+            var curName:String = allNamesCopy.shift();
+
+            // If the name is unique, add it back to the allNames array and move on.
+            if (!allNames.contains(curName))
+            {
+                allNames.push(curName);
+                continue;
+            }
+
+            // Otherwise, rename it to something else.
+            var i:Int = 1;
+            while (allNames.contains(curName + " (" + i + ")")) i++;
+
+            curName = curName + " (" + i + ")";
+            allNames.push(curName);
+
+            allReplayDatas.customName = curName;
+        }
+
+        for (i in 0...allNames.length)
+        {
+            items.byName[validReplayPaths[i]].label.text = allNames[i];
+        }
+    }
+
+    function renameReplay(event:KeyboardEvent)
+    {
+        if (validReplayPaths.length == 0 || !isRenaming || !canType) return;
+        canType = false;
+
+        var curItem = items.selectedItem;
+        switch (event.keyCode)
+        {
+            // SHIFT, CONTROL, BACKSLASH, ESCAPE, LEFT, RIGHT, HOME, DELETE, DOWN, END, ESCAPE
+            case 16 | 17 | 220 | 27 | 39 | 35 | 46 | 38 | 40 | 36 | 37: 
+                return;
+            
+            // TAB
+            case 9:
+                tabDown = !tabDown;
+            
+            // BACKSPACE
+            case 8:
+                if (curItem.label.text.length <= 0) return;
+
+                curItem.label.text = curItem.label.text.substring(0, curItem.label.text.length - 1);
+                FunkinSound.playOnce(Paths.sound("chartingSounds/hitNotePlayer"));
+            
+            // ENTER
+            case 13: 
+                if (curItem.label.text.length <= 0) // The name requires at least one character.
+                {
+                    curItem.label.text = formatReplayName(allReplayDatas[items.selectedIndex]);
+                }
+                else if (curItem.label.text == formatReplayName(allReplayDatas[items.selectedIndex])) // There was no change in the replay name.
+                {
+                    FlxG.stage.removeEventListener("keyDown", renameReplay);
+                    isRenaming = false;    
+                    return;
+                }
+
+                // Do a check for duplicate names.
+                if (allNames.contains(curItem.label.text))
+                {
+                    var i:Int = 1;
+                    while (allNames.contains(curItem.label.text + " (" + i + ")")) i++;
+
+                    curItem.label.text += " (" + i + ")";
+                }
+
+                var finishedText:String = curItem.label.text;
+                var curReplay:Dynamic = allReplayDatas[items.selectedIndex];
+                var previewImg:FlxSprite = replayPreviews.members[replayPreviews.length - 1];
+                curReplay.customName = finishedText;
+
+                // Save the newly made data to the same path.
+                var path:String = inputRecorderModule.scriptGet("REPLAY_FOLDER") + "/replay-" + curReplay.date + "." + inputRecorderModule.scriptGet("REPLAY_EXT");
+                var content:String = Json.stringify(curReplay, null, '  ');
+
+                var entries = [FileUtil.makeZIPEntry("data.json", content), FileUtil.makeZIPEntryFromBytes("preview.png", previewImg.pixels.image.encode())];
+                FileUtil.saveFilesAsZIPToPath(entries, path, FileWriteMode.Force);
+
+                // No need to modify the save file for file paths, as the file path remains the same.
+                // Unbind everything.
+                FlxG.stage.removeEventListener("keyDown", renameReplay);
+                isRenaming = false;
+
+            default:
+                if (event.charCode == 0) return; // non-printable characters crash String.fromCharCode
+
+                var daString:String = fromCharCode(event.charCode);
+                if (event.shiftKey && !tabDown) daString = daString.toUpperCase();
+                else if (!event.shiftKey && tabDown) daString = daString.toUpperCase();
+
+                // Workaround for the bug that happens if spacebar is pressed but doesn't get added to the text.
+                var startString:String = curItem.label.text;
+                curItem.label.text = "";
+
+                if (event.ctrlKey && daString.toLowerCase() == "v")
+                {
+                    daString = (Clipboard.text == null ? "" : Clipboard.text);
+                }
+
+                curItem.label.text = startString + daString;
+                FunkinSound.playOnce(Paths.sound("chartingSounds/hitNotePlayer"));
+        }
     }
 
     function scrolledStatus(previous:Int, next:Int, size:Int)
@@ -286,4 +519,23 @@ class InputViewer extends MusicBeatSubState
 
         return 0;
     }   
+
+    function formatReplayName(replay:Dynamic, ignoreCustom:Bool = false):String
+    {
+        var defaultReplayName:String = replay.songId + " (" + replay.diff + ", " + replay.variation + ")";
+        
+        if (replay.songName != null)
+            defaultReplayName = replay.songName + " (" + replay.diff + ")";
+
+        if (ignoreCustom) return defaultReplayName;
+        return (replay.customName == null ? defaultReplayName : replay.customName);
+    }
+
+    // I stole this from Keoiki because I would've never figured out on my own
+    function fromCharCode(code:Int):String
+    {
+        var u:Utf8 = new Utf8();
+        u.addChar(code);
+        return u.toString();
+    }
 }

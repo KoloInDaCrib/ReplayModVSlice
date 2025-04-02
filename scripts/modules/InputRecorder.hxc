@@ -1,9 +1,12 @@
+package replay;
+
 import flixel.addons.transition.FlxTransitionableState;
 import flixel.math.FlxMath;
 import flixel.text.FlxText;
 import flixel.util.FlxStringUtil;
 import flixel.FlxG;
 import flixel.FlxSprite;
+import funkin.data.freeplay.player.PlayerRegistry;
 import funkin.data.event.SongEventRegistry;
 import funkin.input.PreciseInputManager;
 import funkin.modding.base.ScriptedMusicBeatSubState;
@@ -28,7 +31,6 @@ import haxe.io.Path;
 import haxe.Json;
 import StringTools;
 import Std;
-
 
 /**
  * Records Inputs and also does Replaying!
@@ -88,7 +90,7 @@ class InputRecorder extends Module
 
 	function new() 
 	{
-		super("InputRecorder", FlxMath.MAX_VALUE_INT); //do it last cuz other modules may want to have a cutscene at the end of the song so we don't wanna disrupt that
+		super("InputRecorder", -FlxMath.MAX_VALUE_INT); //do it FIRST in case some modules override countdown behaviour, which is where we set the files up
 	}
 
 	override function onCreate(event) //set all the save stuff up, as well as do migration!
@@ -130,15 +132,19 @@ class InputRecorder extends Module
 
 	var curMode:Int = REPLAY_MODE_NONE;
 	var currentReplay:InputFileData = null;
+	var replayName:String = "None";
 	var allInputsCopy:Array<KeyInputData> = []; //copy of all the inputs since we're using shift() to remove them
+
 	var sprRec:FlxSprite;
+	var totalElapsed:Float = 0; //used for toggling the sprRec's visibility (via trig functions!)
 	
 	var takePreviewTime:Int = -1;
-	var previewSprite:FlxSprite = null;
+	var previewImage:BitmapData = null;
 
 	var leavingReplay:Bool = false; //open substate after leaving replay
-	var totalElapsed:Float = 0; //used for toggling the sprRec's visibility (via trig functions!)
+	var curSelectedReplay:Int = 0; //no static variables yet so this is the next best thing, will be set from the InputViewerState!
 	var allowedReplayControls:Array<Int> = []; //keycodes of the controls allowed to be used during replays
+	var stickerSubState:StickerSubState = null;
 
 	var skipTimeTxt:FlxText = null;
 	var timeToSkipTo:Float = 0;
@@ -148,12 +154,11 @@ class InputRecorder extends Module
 	{
 		super.onCountdownStart(event);
 		if (curMode == REPLAY_MODE_NONE && currentReplay != null) return; //We have initiated a replay, but due to a cutscene, haven't started the gameplay
+		if (PlayState.instance == null || PlayState.instance.isBotPlayMode || PlayState.instance.isSubState) return;
 
 		restoreEvents();
 		takePreviewTime = -1;
-		previewSprite = null;
-
-		if (PlayState.instance == null || PlayState.instance.isBotPlayMode || PlayState.instance.isSubState) return;
+		previewImage = null;
 
 		sprRec = new FlxSprite(0, -45);
 		sprRec.cameras = [PlayState.instance.camHUD];
@@ -210,22 +215,21 @@ class InputRecorder extends Module
 			FlxG.stage.application.window.onKeyUpPrecise.removeAll();
 			FlxG.stage.application.window.onKeyDownPrecise.removeAll();
 
-			@:privateAccess  //ban every key except those in BLACKLIST_CONTROLS_REPLAY from being usable
+			//ban every key except those in BLACKLIST_CONTROLS_REPLAY from being usable
+			
+			FlxG.stage.removeEventListener(KeyboardEvent.KEY_DOWN, FlxG.keys.onKeyDown);
+			FlxG.stage.removeEventListener(KeyboardEvent.KEY_UP, FlxG.keys.onKeyUp);
+			FlxG.stage.addEventListener(KeyboardEvent.KEY_DOWN, handleReplayKeyDown);
+			FlxG.stage.addEventListener(KeyboardEvent.KEY_UP, handleReplayKeyUp);
+
+			for (action in FlxG.state.controls.digitalActions)
 			{
-				FlxG.stage.removeEventListener(KeyboardEvent.KEY_DOWN, FlxG.keys.onKeyDown);
-				FlxG.stage.removeEventListener(KeyboardEvent.KEY_UP, FlxG.keys.onKeyUp);
-				FlxG.stage.addEventListener(KeyboardEvent.KEY_DOWN, handleReplayKeyDown);
-				FlxG.stage.addEventListener(KeyboardEvent.KEY_UP, handleReplayKeyUp);
+				if (!BLACKLIST_CONTROLS_REPLAY.contains(action.name.toUpperCase())) continue;
 
-				for (action in FlxG.state.controls.digitalActions)
+				for (input in action.inputs)
 				{
-					if (!BLACKLIST_CONTROLS_REPLAY.contains(action.name.toUpperCase())) continue;
-
-					for (input in action.inputs)
-					{
-						if (Std.string(input.device) != "KEYBOARD") continue;
-						allowedReplayControls.push(input.inputID);
-					}
+					if (Std.string(input.device) != "KEYBOARD") continue;
+					allowedReplayControls.push(input.inputID);
 				}
 			}
 			
@@ -240,38 +244,27 @@ class InputRecorder extends Module
 	{
 		super.onUpdate(event);
 
-		//sprRec neat tween
-		if (curMode != REPLAY_MODE_NONE && sprRec != null) 
+		// Tween the sprRec
+		if (curMode != REPLAY_MODE_NONE && sprRec != null && FlxG.state.subState == null) 
 		{
 			totalElapsed += event.elapsed * 5;
 			sprRec.visible = (Math.cos(totalElapsed) > 0);
 		}
 		
-		//the part where it does the replay
+		// Activate the inputs during a replay
 		if (curMode == REPLAY_MODE_REPLAY) 
 		{
-			while (allInputsCopy.length > 0 && allInputsCopy[0].mark <= Conductor.instance.songPosition - Conductor.instance.combinedOffset)
+			while (allInputsCopy.length > 0 && allInputsCopy[0].mark <= Conductor.instance.songPosition)
 			{
-				var curInput = allInputsCopy.shift();
-
-				@:privateAccess 
-				{
-					var convertedKeyCode = PreciseInputManager.convertKeyCode(curInput.keyID);
-					if (!allowedReplayControls.contains(convertedKeyCode)) FlxG.keys.updateKeyStates(convertedKeyCode, curInput.down);
-
-					if (curInput.down)
-					{
-						PreciseInputManager.instance.handleKeyDown(curInput.keyID, curInput.mod, PreciseInputManager.getCurrentTimestamp() / PreciseInputManager.NS_PER_MS);
-					}
-					else 
-					{
-						PreciseInputManager.instance.handleKeyUp(curInput.keyID, curInput.mod, PreciseInputManager.getCurrentTimestamp() / PreciseInputManager.NS_PER_MS);
-					}	
-				}
+				var curInput:KeyInputData = allInputsCopy.shift();
+				triggerInput(curInput);
 			}
+
+			// Nabbed some code from processNotes to ensure that the player keeps holding the hold note during replay
+			processReplayHoldNoteBehaviour();
 		}
 
-		//take a gameplay preview picture at a random point in time
+		// Take a preview during the random point of the gameplay
 		if (curMode == REPLAY_MODE_RECORD && FlxG.sound.music != null) 
 		{
 			if (takePreviewTime < 0)
@@ -279,13 +272,27 @@ class InputRecorder extends Module
 				takePreviewTime = FlxG.random.int(0, FlxG.sound.music.length - 1000);
 			}
 
-			if (FlxG.sound.music.time >= takePreviewTime && previewSprite == null)
+			if (FlxG.sound.music.time >= takePreviewTime && previewImage == null)
 			{
-				previewSprite = new FlxSprite().loadGraphic(BitmapData.fromImage(FlxG.stage.window.readPixels()));
+				previewImage = BitmapData.fromImage(FlxG.stage.window.readPixels());
 			}
 		}
+
+		// If the player has activated practice mode during any point of the recording, update the replay file
+		if (curMode == REPLAY_MODE_RECORD && currentReplay != null && currentReplay.practice != PlayState.instance.isPracticeMode)
+		{
+			currentReplay.practice = PlayState.instance.isPracticeMode;
+		}
+
+		// If something has activated botplay while we're doing a recording, stop recording immidiately
+		if (curMode == REPLAY_MODE_RECORD && PlayState.instance.isBotPlayMode)
+		{
+			curMode == REPLAY_MODE_NONE;
+			currentReplay = null;
+			restoreEvents();
+		}
 		
-		//main menu stuff with the submenu
+		// If the player is in the main menu, pressing G will take you to the viewer substate
 		if (Std.isOfType(FlxG.state, MainMenuState) && FlxG.state.subState == null) 
 		{
 			FlxG.state.rightWatermarkText.text = "Press G to open the Menu with all Replays."; //insert one of those cool ass skeleton images with the letter g highlighted
@@ -296,7 +303,8 @@ class InputRecorder extends Module
 			}
 		}
 
-		//controls the text behind setting the replay time for the pause menu
+		// Logic behind the text used to skip to a certain time during a replay
+		// Nabbed from Psych Engine!
 		if (curMode == REPLAY_MODE_REPLAY && Std.isOfType(FlxG.state.subState, PauseSubState) && skipTimeTxt != null) 
 		{
 			if (FlxG.state.subState.currentEntry == 2)
@@ -324,37 +332,36 @@ class InputRecorder extends Module
 
 			var skipTimeTracker = FlxG.state.subState.menuEntryText.members[2];
 			skipTimeTxt.x = skipTimeTracker.x + skipTimeTracker.width + 60;
-			skipTimeTxt.y = skipTimeTracker.y;
+			skipTimeTxt.y = skipTimeTracker.y + skipTimeTracker.height / 2 - skipTimeTxt.height / 2;
 			skipTimeTxt.visible = (FlxG.state.subState.currentEntry == 2);
 
 			skipTimeTxt.text = FlxStringUtil.formatTime(Math.max(0, Math.floor(timeToSkipTo / 1000)), false) + "/" + FlxStringUtil.formatTime(Math.max(0, Math.floor(FlxG.sound.music.length / 1000)), false);
 		}
 	}
 
-	var stickerSubState = null;
 
-	override function onStateChangeEnd(event) //adds an option to enable input recording
+	override function onStateChangeEnd(event)
 	{
-		if (Std.isOfType(event.targetState, OptionsState))
+		// Add an option to enable input recording.
+		if (Std.isOfType(FlxG.state, OptionsState))
 		{
-			@:privateAccess
-			{
-				event.targetState.pages["preferences"].createPrefItemCheckbox('Enable Recording', 'Enables the Recording Process of Replays.', function(value:Bool):Void {
-					Save.instance.modOptions.set(REPLAY_SAVE_ENABLED, value);
-					Save.instance.flush();
-				  }, Save.instance.modOptions.get(REPLAY_SAVE_ENABLED));
-			}
+			FlxG.state.optionsCodex.pages["preferences"].createPrefItemCheckbox('Enable Recording', 'Enables the Recording Process of Replays.', function(value:Bool):Void {
+				Save.instance.modOptions.set(REPLAY_SAVE_ENABLED, value);
+				Save.instance.flush();
+			  }, Save.instance.modOptions.get(REPLAY_SAVE_ENABLED));
 		}
-		if (Std.isOfType(event.targetState, MainMenuState) && leavingReplay)
+
+		// Open input viewer substate if leaving a replay.
+		if (Std.isOfType(FlxG.state, MainMenuState) && leavingReplay)
 		{
 			leavingReplay = false;
-			openViewerSubState(event.targetState, stickerSubState);
+			openViewerSubState(FlxG.state, stickerSubState);
 		}
 	}
 
 	function openViewerSubState(state, stickers)
 	{
-		var subState = ScriptedMusicBeatSubState.init("InputViewer"); //shoutouts abnormalpoof for funker selector because otherwise i wouldn't know how to do this lol
+		var subState = ScriptedMusicBeatSubState.init("replay.InputViewer"); //shoutouts abnormalpoof for funker selector because otherwise i wouldn't know how to do this lol
 		state.persistentUpdate = false;
 		state.openSubState(subState);
 
@@ -382,6 +389,7 @@ class InputRecorder extends Module
 			curMode = REPLAY_MODE_NONE;
 			currentReplay = null;
 			restoreEvents();
+			FlxG.random.resetInitialSeed();
 		}
 		else if (curMode == REPLAY_MODE_RECORD) 
 		{
@@ -398,63 +406,69 @@ class InputRecorder extends Module
 	{
 		if (Std.isOfType(event.targetState, PauseSubState) && curMode == REPLAY_MODE_REPLAY) 
 		{
-			@:privateAccess 
-			{
-				if (PlayState.instance.currentConversation != null || VideoCutscene.isPlaying()) return;
+			if (PlayState.instance.currentConversation != null || VideoCutscene.isPlaying()) return;
 
-				event.targetState.resetSelection();
-				event.targetState.currentMenuEntries = [
-				{text: 'Resume', callback: PauseSubState.PAUSE_MENU_ENTRIES_STANDARD[0].callback},
-				{text: 'Restart', callback: PauseSubState.PAUSE_MENU_ENTRIES_STANDARD[1].callback},
-				{text: 'Skip to Time', callback: function(state) 
+			event.targetState.resetSelection();
+			event.targetState.currentMenuEntries = [
+			{text: 'Resume', callback: PauseSubState.PAUSE_MENU_ENTRIES_STANDARD[0].callback},
+			{text: 'Restart', callback: PauseSubState.PAUSE_MENU_ENTRIES_STANDARD[1].callback},
+			{text: 'Skip to Time', callback: function(state) 
+				{
+					if (FlxG.sound.music != null)
 					{
-						if (FlxG.sound.music != null)
+						Conductor.instance.update(timeToSkipTo);
+						PlayState.instance.handleSkippedNotes();
+						SongEventRegistry.handleSkippedEvents(PlayState.instance.songEvents, Conductor.instance.songPosition);
+
+						allInputsCopy = currentReplay.inputs.copy();
+
+						while (allInputsCopy.length > 0 && allInputsCopy[0].mark <= Conductor.instance.songPosition)
 						{
-							Conductor.instance.update(timeToSkipTo);
-							PlayState.instance.handleSkippedNotes();
-							SongEventRegistry.handleSkippedEvents(PlayState.instance.songEvents, Conductor.instance.songPosition);
+							var curInput:KeyInputData = allInputsCopy.shift();
 
-							allInputsCopy = currentReplay.inputs.copy();
-
-							while (allInputsCopy.length > 0 && allInputsCopy[0].mark <= Conductor.instance.songPosition - Conductor.instance.combinedOffset)
-								allInputsCopy.shift();
-							
-							state.close();
+							// If the time is skipped to, for example, a held note, we would need to activate curInput to not break the hold note or anything.
+							if (allInputsCopy.length > 0 && allInputsCopy[0].mark > Conductor.instance.songPosition && curInput.down)
+							{
+								triggerInput(curInput);
+							}
 						}
+							
+						state.close();
 					}
-				},
-				{text: "Quit", callback: function(state)
-					{
-						state.allowInput = false;
-						PlayState.instance.deathCounter = 0;
-
-						FlxTransitionableState.skipNextTransIn = true;
-						FlxTransitionableState.skipNextTransOut = true;
-
-						stickerSubState = new StickerSubState(null, (sticker) -> new MainMenuState());
-						state.openSubState(stickerSubState);
-					}
-				}];
-
-				if (FlxG.sound.music == null)
-				{
-					event.targetState.currentMenuEntries.remove(event.targetState.currentMenuEntries[2]);
 				}
-
-				event.targetState.clearAndAddMenuEntries();
-				event.targetState.metadataDeaths.text = "Viewing Replay";
-				event.targetState.changeSelection();
-
-				if (FlxG.sound.music != null)
+			},
+			{text: "Quit", callback: function(state)
 				{
-					skipTimeTxt = new FlxText(0, 0, 0, 'tate', 64);
-					skipTimeTxt.setFormat(Paths.font("vcr.ttf"), 64, 0xFFFFFFFF, "center", FlxG.state.leftWatermarkText.borderStyle, 0xFF000000);
-					skipTimeTxt.scrollFactor.set();
-					skipTimeTxt.borderSize = 4;
+					state.allowInput = false;
+					PlayState.instance.deathCounter = 0;
 
-					event.targetState.add(skipTimeTxt);
-					timeToSkipTo = FlxG.sound.music.time;
+					FlxTransitionableState.skipNextTransIn = true;
+					FlxTransitionableState.skipNextTransOut = true;
+
+					stickerSubState = new StickerSubState(generateStickerData());
+					state.openSubState(stickerSubState);
 				}
+			}];
+
+			// The game loads music only after countdown is done, and since we can pause the game during the countdown, having the option to skip to time would cause crashes.
+			if (FlxG.sound.music == null)
+			{
+				event.targetState.currentMenuEntries.remove(event.targetState.currentMenuEntries[2]);
+			}
+
+			event.targetState.clearAndAddMenuEntries();
+			event.targetState.metadataDeaths.text = "\nViewing Replay\n\"" + replayName + "\"";
+			event.targetState.changeSelection();
+
+			if (FlxG.sound.music != null)
+			{
+				skipTimeTxt = new FlxText(0, 0, 0, 'test', 68);
+				skipTimeTxt.setFormat(Paths.font("vcr.ttf"), 68, 0xFFFFFFFF, "center", FlxG.state.leftWatermarkText.borderStyle, 0xFF000000);
+				skipTimeTxt.scrollFactor.set();
+				skipTimeTxt.borderSize = 5;
+
+				event.targetState.add(skipTimeTxt);
+				timeToSkipTo = FlxG.sound.music.time;
 			}
 		}
 	}
@@ -465,12 +479,17 @@ class InputRecorder extends Module
 		if (curMode == REPLAY_MODE_REPLAY) 
 		{
 			event.cancel(); 
-			stickerSubState = new StickerSubState(null, (sticker) -> new MainMenuState());
+			stickerSubState = new StickerSubState(generateStickerData());
 			FlxG.state.openSubState(stickerSubState);
 		}
 
 		if (currentReplay != null && curMode == REPLAY_MODE_RECORD)
 		{
+			// If the previewImage is null, that means that the song has ended before it should.
+			// For instance, when player pico gets shot during the pico pico cutscenes.
+			// In my opinion, the replay shouldn't be saved in that case, as there wouldn't be any gameplay worth replaying.
+			if (previewImage == null) return;
+			
 			currentReplay.scores.shit = Highscore.tallies.shit;
 			currentReplay.scores.bad = Highscore.tallies.bad;
 			currentReplay.scores.good = Highscore.tallies.good;
@@ -484,39 +503,67 @@ class InputRecorder extends Module
 			var path:String = REPLAY_FOLDER + "/replay-" + currentReplay.date + "." + REPLAY_EXT;
 			var content:String = Json.stringify(currentReplay, null, '  ');
 
-			var entries = [FileUtil.makeZIPEntry("data.json", content), FileUtil.makeZIPEntryFromBytes("preview.png", previewSprite.pixels.image.encode())];
+			var entries = [FileUtil.makeZIPEntry("data.json", content), FileUtil.makeZIPEntryFromBytes("preview.png", previewImage.image.encode())];
 			FileUtil.saveFilesAsZIPToPath(entries, path);
 
 			var replayPaths:Array<String> = [path].concat(Save.instance.modOptions.get(REPLAY_SAVE_PATHS));
 			Save.instance.modOptions.set(REPLAY_SAVE_PATHS, replayPaths);
 			Save.instance.flush();
 
-			previewSprite.destroy();
+			previewImage.dispose();
 			currentReplay = null;
 		}
+	}
+
+	// Trigger an input based on the input data provided.
+	function triggerInput(input:KeyInputData)
+	{
+		var convertedKeyCode:Int = PreciseInputManager.convertKeyCode(input.keyID);
+		if (!allowedReplayControls.contains(convertedKeyCode)) FlxG.keys.updateKeyStates(convertedKeyCode, input.down);
+
+		if (input.down)
+		{
+			PreciseInputManager.instance.handleKeyDown(input.keyID, input.mod, PreciseInputManager.getCurrentTimestamp() / PreciseInputManager.NS_PER_MS);
+		}
+		else 
+		{
+			PreciseInputManager.instance.handleKeyUp(input.keyID, input.mod, PreciseInputManager.getCurrentTimestamp() / PreciseInputManager.NS_PER_MS);
+		}	
+	}
+
+	// See PlayState > processNotes
+	function processReplayHoldNoteBehaviour()
+	{
+		if (curMode != REPLAY_MODE_REPLAY || FlxG.state?.playerStrumline?.notes?.members == null || FlxG.state.isInCutscene) return;
+
+		for (holdNote in FlxG.state.playerStrumline.holdNotes.members)
+		{
+			if (holdNote == null || !holdNote.alive) continue;
+			if (!holdNote.hitNote || holdNote.missedNote || holdNote.sustainLength <= 0) continue;
+				  
+			if (FlxG.state.currentStage != null && FlxG.state.currentStage.getBoyfriend() != null && FlxG.state.currentStage.getBoyfriend().isSinging())
+			{
+				FlxG.state.currentStage.getBoyfriend().holdTimer = 0;
+			}
+		}  
 	}
 
 	//restore events and kill off sprRec
 	function restoreEvents() 
 	{
-		FlxG.random.resetInitialSeed();
-
 		FlxG.stage.application.window.onKeyUpPrecise.removeAll();
 		FlxG.stage.application.window.onKeyDownPrecise.removeAll();
 		FlxG.stage.application.window.onKeyDownPrecise.add(FlxG.stage.application.window.application.onKeyDownPrecise);
 		FlxG.stage.application.window.onKeyUpPrecise.add(FlxG.stage.application.window.application.onKeyUpPrecise);
 
-		@:privateAccess
-		{
-			FlxG.stage.application.window.onKeyDownPrecise.add(PreciseInputManager.instance.handleKeyDown);
-			FlxG.stage.application.window.onKeyUpPrecise.add(PreciseInputManager.instance.handleKeyUp);
+		FlxG.stage.application.window.onKeyDownPrecise.add(PreciseInputManager.instance.handleKeyDown);
+		FlxG.stage.application.window.onKeyUpPrecise.add(PreciseInputManager.instance.handleKeyUp);
 
-			FlxG.stage.addEventListener(KeyboardEvent.KEY_DOWN, FlxG.keys.onKeyDown);
-			FlxG.stage.addEventListener(KeyboardEvent.KEY_UP, FlxG.keys.onKeyUp);
-			FlxG.stage.removeEventListener(KeyboardEvent.KEY_DOWN, handleReplayKeyDown);
-			FlxG.stage.removeEventListener(KeyboardEvent.KEY_UP, handleReplayKeyUp);
-		}
-
+		FlxG.stage.addEventListener(KeyboardEvent.KEY_DOWN, FlxG.keys.onKeyDown);
+		FlxG.stage.addEventListener(KeyboardEvent.KEY_UP, FlxG.keys.onKeyUp);
+		FlxG.stage.removeEventListener(KeyboardEvent.KEY_DOWN, handleReplayKeyDown);
+		FlxG.stage.removeEventListener(KeyboardEvent.KEY_UP, handleReplayKeyUp);
+		
 		if (sprRec != null)
 		{
 			sprRec.kill();
@@ -525,7 +572,25 @@ class InputRecorder extends Module
 		}
 	}
 
-	//these are there to not clutter up the blacklist keys array
+	// To be replaced once a non-hardcoded system were to get implemented.
+	function generateStickerData()
+	{
+		var charID:String = PlayerRegistry.instance.getCharacterOwnerId(PlayState.instance.currentChart.characters.player);
+		var stickerSet:String = (charID == "pico" ? "stickers-set-2" : "stickers-set-1");
+		var stickerPack:String = "all";
+
+		switch(PlayState.instance.currentChart.song.id) 
+		{
+			case "2hot" | "darnell" | "lit-up": // Why doesn't this include blazin?
+				stickerPack = "weekend";
+			case "tutorial":
+				stickerPack = "tutorial";
+		}
+
+		return {targetState : (sticker) -> new MainMenuState(), stickerSet: stickerSet, stickerPack: stickerPack};
+	}
+
+	//these are separate to not clutter up the blacklist keys array
 	var UI_KEYS:Array<String> = [
 		"UI_UP", "UI_LEFT", "UI_RIGHT", "UI_DOWN", 
 		"UI_UP_P", "UI_LEFT_P", "UI_RIGHT_P", "UI_DOWN_P", 
@@ -548,7 +613,7 @@ class InputRecorder extends Module
 		{
 			keyID: Std.int(keyCode),
 			mod:  Std.int(_),
-			mark: Conductor.instance.songPosition - Conductor.instance.combinedOffset, 
+			mark: (Conductor.instance.songPosition - Conductor.instance.combinedOffset), 
 			down: true
 		});
 	}
@@ -563,25 +628,19 @@ class InputRecorder extends Module
 		{
 			keyID: Std.int(keyCode),
 			mod:  Std.int(_),
-			mark: Conductor.instance.songPosition - Conductor.instance.combinedOffset,
+			mark: (Conductor.instance.songPosition - Conductor.instance.combinedOffset),
 			down: false
 		});
 	}
 
 	function handleReplayKeyDown(event)
 	{
-		@:privateAccess
-		{
-			if (allowedReplayControls.contains(event.keyCode)) FlxG.keys.onKeyDown(event);
-		}
+		if (allowedReplayControls.contains(event.keyCode)) FlxG.keys.onKeyDown(event);
 	}
 
 	function handleReplayKeyUp(event)
 	{
-		@:privateAccess
-		{
-			if (allowedReplayControls.contains(event.keyCode)) FlxG.keys.onKeyUp(event);
-		}
+		if (allowedReplayControls.contains(event.keyCode)) FlxG.keys.onKeyUp(event);
 	}
 
 	function isABlacklistedControlActive()
@@ -619,6 +678,7 @@ typedef InputFileData =
 	var seed:Int;
 	var scores:InputScoreData;
 	var date:String;
+	var customName:Null<String>;
 }
 
 typedef KeyInputData =
